@@ -50,7 +50,7 @@
 const DB_SHEET_NAME = 'utf_ken_all';
 const RESULT_SHEET_NAME = '結果';
 const HEADER_ROWS = 1;
-const MAX_EXECUTION_TIME = 300000;
+const MAX_EXECUTION_TIME = 240000; // 4分（GAS6分制限に対しマージンを確保）
 
 // ★【追加】対象とする入力シート名をすべてここに記述してください
 const TARGET_SHEETS = ['0303_1530まで分', '0305_1430まで分', '0401_1835まで分'];
