@@ -14,7 +14,8 @@
  *   - startSearchByIds()        : 受付番号を指定して検索・処理する
  *   - startProcessByMemo()      : 「メモ」列が「変更」の行を自動抽出して処理する
  *   - startProcessAllSheets()   : TARGET_SHEETS の全件を一括処理する（中断・再開対応）
- *   - startFromRequestId()      : 指定した受付番号以降を全件処理する
+ *   - startFromRequestId()      : 指定した受付番号以降を全件処理する（中断・再開対応）
+ *   - runFromSheetAndIndex_()    : startFromRequestId の内部実行関数
  *   - startFromSpecificIndex()  : 任意のインデックスから処理を再開する（リカバリ用）
  *   - resetProgress()           : 中断時の進捗情報をリセットする
  *
@@ -454,11 +455,55 @@ function formatZipCode_(zip) {
 }
 
 /**
- * 指定した受付番号以降を全件処理する関数
- * 受付番号を入力すると、その番号がある行を見つけ、そこから最後まで処理を実行する。
+ * 指定した受付番号以降を全件処理する関数（中断・再開対応）
+ *
+ * 初回: 受付番号を入力すると、その番号がある行を見つけ、そこから処理を開始する。
+ * 再開: 前回中断した場合、受付番号の入力なしで続きから自動再開する。
  */
 function startFromRequestId() {
   const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const db = loadKenAllDbHighPrecision_();
+  const apiKey = props.getProperty('GEMINI_API_KEY');
+
+  if (!apiKey) {
+    ui.alert('APIキーが設定されていません。');
+    return;
+  }
+
+  // 中断情報があるか確認
+  const resumeSheetName = props.getProperty('RESUME_SHEET');
+  const resumeIndex = parseInt(props.getProperty('RESUME_INDEX') || "-1", 10);
+
+  if (resumeSheetName && resumeIndex >= 0) {
+    // --- 再開モード ---
+    const resumeConfirm = ui.alert(
+      '前回の続きがあります',
+      `「${resumeSheetName}」の ${resumeIndex + 1} 行目から再開しますか？\n（キャンセルで最初からやり直し）`,
+      ui.ButtonSet.YES_NO
+    );
+
+    if (resumeConfirm === ui.Button.YES) {
+      const resumeSheetIdx = TARGET_SHEETS.indexOf(resumeSheetName);
+      if (resumeSheetIdx === -1) {
+        ui.alert(`シート「${resumeSheetName}」が見つかりません。中断情報をリセットします。`);
+        props.deleteProperty('RESUME_SHEET');
+        props.deleteProperty('RESUME_INDEX');
+        return;
+      }
+
+      runFromSheetAndIndex_(resumeSheetIdx, resumeIndex, db, apiKey);
+      return;
+    } else {
+      // リセットして最初からやり直し
+      props.deleteProperty('RESUME_SHEET');
+      props.deleteProperty('RESUME_INDEX');
+    }
+  }
+
+  // --- 初回モード: 受付番号を入力 ---
   const response = ui.prompt(
     '受付番号から続きを実行',
     '開始したい受付番号を入力してください（例: 122267-2926）：',
@@ -473,17 +518,7 @@ function startFromRequestId() {
     return;
   }
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const db = loadKenAllDbHighPrecision_();
-  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-
-  if (!apiKey) {
-    ui.alert('APIキーが設定されていません。');
-    return;
-  }
-
-  let found = false;
-
+  // 対象シートから受付番号を検索
   for (let s = 0; s < TARGET_SHEETS.length; s++) {
     const sheetName = TARGET_SHEETS[s];
     const sh = ss.getSheetByName(sheetName);
@@ -496,40 +531,53 @@ function startFromRequestId() {
 
     const dataRows = allData.slice(HEADER_ROWS);
 
-    // 指定された受付番号の行を探す
-    let startIdx = -1;
     for (let i = 0; i < dataRows.length; i++) {
       if (dataRows[i][requestIdIdx].toString() === targetId) {
-        startIdx = i;
-        break;
+        const remaining = dataRows.length - i;
+        ui.alert(`「${sheetName}」の ${i + 1} 行目（受付番号: ${targetId}）から ${remaining} 件を処理します。`);
+        runFromSheetAndIndex_(s, i, db, apiKey);
+        return;
       }
     }
+  }
 
-    if (startIdx !== -1) {
-      found = true;
-      const remaining = dataRows.length - startIdx;
-      ui.alert(`「${sheetName}」の ${startIdx + 1} 行目（受付番号: ${targetId}）から ${remaining} 件を処理します。`);
+  ui.alert(`受付番号「${targetId}」はどのシートにも見つかりませんでした。`);
+}
 
-      // 該当シートの指定行以降を処理
-      processPostalData(startIdx, dataRows, sheetName, db, apiKey);
+/**
+ * 指定シート・行番号から処理を実行する内部関数（中断時は再開情報を保存）
+ */
+function runFromSheetAndIndex_(sheetIdx, startIdx, db, apiKey) {
+  const props = PropertiesService.getScriptProperties();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-      // 該当シートより後のシートも全件処理
-      for (let s2 = s + 1; s2 < TARGET_SHEETS.length; s2++) {
-        const nextSheetName = TARGET_SHEETS[s2];
-        const nextSh = ss.getSheetByName(nextSheetName);
-        if (!nextSh) continue;
-        const nextDataRows = nextSh.getDataRange().getValues().slice(HEADER_ROWS);
-        processPostalData(0, nextDataRows, nextSheetName, db, apiKey);
-      }
+  for (let s = sheetIdx; s < TARGET_SHEETS.length; s++) {
+    const sheetName = TARGET_SHEETS[s];
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) continue;
 
-      ui.alert('処理が完了しました。');
+    const dataRows = sh.getDataRange().getValues().slice(HEADER_ROWS);
+    const idx = (s === sheetIdx) ? startIdx : 0;
+
+    const isFinished = processPostalData(idx, dataRows, sheetName, db, apiKey);
+
+    if (!isFinished) {
+      // 中断: 次回の再開情報を保存
+      const nextIndex = parseInt(props.getProperty('LAST_INDEX') || "0", 10);
+      props.setProperty('RESUME_SHEET', sheetName);
+      props.setProperty('RESUME_INDEX', nextIndex.toString());
+      SpreadsheetApp.getUi().alert(
+        `時間制限のため中断しました。\n「${sheetName}」の ${nextIndex + 1} 行目から再開できます。\n\n再開するには startFromRequestId を再度実行してください。`
+      );
       return;
     }
   }
 
-  if (!found) {
-    ui.alert(`受付番号「${targetId}」はどのシートにも見つかりませんでした。`);
-  }
+  // 全シート完了
+  props.deleteProperty('RESUME_SHEET');
+  props.deleteProperty('RESUME_INDEX');
+  props.deleteProperty('LAST_INDEX');
+  SpreadsheetApp.getUi().alert('すべての処理が完了しました！');
 }
 
 /**
